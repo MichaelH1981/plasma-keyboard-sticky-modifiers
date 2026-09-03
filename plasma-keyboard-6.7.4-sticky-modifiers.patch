@@ -1,0 +1,353 @@
+diff --git a/autotests/mockinputmethodcompositor.cpp b/autotests/mockinputmethodcompositor.cpp
+--- a/autotests/mockinputmethodcompositor.cpp
++++ b/autotests/mockinputmethodcompositor.cpp
+@@ -35,6 +35,7 @@
+ #include <sys/mman.h>
+ #include <unistd.h>
+ #include <xkbcommon/xkbcommon-compose.h>
++#include <xkbcommon/xkbcommon-names.h>
+ 
+ #define PLASMA_KEYBOARD_UNDER_GDB 0
+ 
+@@ -91,6 +92,21 @@ public:
+         send_key(++m_serial, static_cast<uint32_t>(m_timer.elapsed()), key, state);
+     }
+ 
++    void sendModifiers(uint32_t depressed)
++    {
++        send_modifiers(++m_serial, depressed, 0, 0, 0);
++    }
++
++    uint32_t controlMask() const
++    {
++        return m_controlMask;
++    }
++
++    uint32_t altMask() const
++    {
++        return m_altMask;
++    }
++
+     bool keymapped() const
+     {
+         return m_keymapped;
+@@ -124,6 +140,11 @@ public:
+             return;
+         }
+ 
++        const xkb_mod_index_t controlIndex = xkb_keymap_mod_get_index(keymap.get(), XKB_MOD_NAME_CTRL);
++        m_controlMask = controlIndex == XKB_MOD_INVALID ? 0 : uint32_t(1) << controlIndex;
++        const xkb_mod_index_t altIndex = xkb_keymap_mod_get_index(keymap.get(), XKB_MOD_NAME_ALT);
++        m_altMask = altIndex == XKB_MOD_INVALID ? 0 : uint32_t(1) << altIndex;
++
+         char *mapStr = xkb_keymap_get_as_string(keymap.get(), XKB_KEYMAP_FORMAT_TEXT_V1);
+         if (!mapStr) {
+             qWarning() << "Failed to get xkb keymap string";
+@@ -172,6 +190,8 @@ private:
+ 
+     bool m_keymapped = false;
+     uint32_t m_serial = 0;
++    uint32_t m_controlMask = 0;
++    uint32_t m_altMask = 0;
+     QElapsedTimer m_timer;
+     wl_resource *m_focusSurface = nullptr;
+ };
+@@ -196,6 +215,8 @@ Q_SIGNALS:
+     void keyboardGrabbed();
+     void commitStringChanged(const QString &commitString);
+     void keysymReceived(uint32_t sym, uint32_t state);
++    void keyReceived(uint32_t key, uint32_t state);
++    void modifiersReceived(uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group);
+ 
+ protected:
+     void zwp_input_method_context_v1_destroy(Resource *resource) override
+@@ -229,6 +250,25 @@ protected:
+         Q_EMIT keysymReceived(sym, state);
+     }
+ 
++    void zwp_input_method_context_v1_key(Resource *resource, uint32_t serial, uint32_t time, uint32_t key, uint32_t state) override
++    {
++        Q_UNUSED(resource);
++        qInfo() << "key" << serial << time << key << state;
++        Q_EMIT keyReceived(key, state);
++    }
++
++    void zwp_input_method_context_v1_modifiers(Resource *resource,
++                                               uint32_t serial,
++                                               uint32_t depressed,
++                                               uint32_t latched,
++                                               uint32_t locked,
++                                               uint32_t group) override
++    {
++        Q_UNUSED(resource);
++        qInfo() << "modifiers" << serial << depressed << latched << locked << group;
++        Q_EMIT modifiersReceived(depressed, latched, locked, group);
++    }
++
+     void zwp_input_method_context_v1_grab_keyboard(Resource *resource, uint32_t keyboard) override
+     {
+         m_keyboard = std::make_unique<InputMethodKeyboard>(resource->client(), keyboard, resource->version());
+@@ -680,6 +722,78 @@ private Q_SLOTS:
+         setKeymap("us", nullptr);
+     }
+ 
++    void testModifiedKeyForwarding()
++    {
++        auto *context = m_inputMethod->context();
++        auto *keyboard = context->keyboard();
++        QVERIFY(keyboard);
++        QVERIFY(keyboard->controlMask());
++
++        QSignalSpy keySpy(context, &InputMethodContext::keyReceived);
++        QSignalSpy modifierSpy(context, &InputMethodContext::modifiersReceived);
++        QSignalSpy commitStringSpy(context, &InputMethodContext::commitStringChanged);
++
++        keyboard->sendModifiers(keyboard->controlMask());
++        wl_display_flush_clients(m_compositor->display());
++        QTest::qWait(20);
++        sendKey(KEY_C, 10);
++        keyboard->sendModifiers(0);
++        wl_display_flush_clients(m_compositor->display());
++
++        QTRY_COMPARE(keySpy.count(), 2);
++        QCOMPARE(keySpy.at(0).at(0).toUInt(), uint32_t(KEY_C));
++        QCOMPARE(keySpy.at(0).at(1).toUInt(), uint32_t(WL_KEYBOARD_KEY_STATE_PRESSED));
++        QCOMPARE(keySpy.at(1).at(0).toUInt(), uint32_t(KEY_C));
++        QCOMPARE(keySpy.at(1).at(1).toUInt(), uint32_t(WL_KEYBOARD_KEY_STATE_RELEASED));
++        QVERIFY(commitStringSpy.isEmpty());
++
++        bool sawControl = false;
++        bool sawClearAfterControl = false;
++        for (const QList<QVariant> &args : modifierSpy) {
++            const uint32_t depressed = args.at(0).toUInt();
++            sawControl |= depressed == keyboard->controlMask();
++            sawClearAfterControl |= sawControl && depressed == 0;
++        }
++        QVERIFY(sawControl);
++        QVERIFY(sawClearAfterControl);
++    }
++
++    void testAltModifiedKeyForwarding()
++    {
++        auto *context = m_inputMethod->context();
++        auto *keyboard = context->keyboard();
++        QVERIFY(keyboard);
++        QVERIFY(keyboard->altMask());
++
++        QSignalSpy keySpy(context, &InputMethodContext::keyReceived);
++        QSignalSpy modifierSpy(context, &InputMethodContext::modifiersReceived);
++        QSignalSpy commitStringSpy(context, &InputMethodContext::commitStringChanged);
++
++        keyboard->sendModifiers(keyboard->altMask());
++        wl_display_flush_clients(m_compositor->display());
++        QTest::qWait(20);
++        sendKey(KEY_F, 10);
++        keyboard->sendModifiers(0);
++        wl_display_flush_clients(m_compositor->display());
++
++        QTRY_COMPARE(keySpy.count(), 2);
++        QCOMPARE(keySpy.at(0).at(0).toUInt(), uint32_t(KEY_F));
++        QCOMPARE(keySpy.at(0).at(1).toUInt(), uint32_t(WL_KEYBOARD_KEY_STATE_PRESSED));
++        QCOMPARE(keySpy.at(1).at(0).toUInt(), uint32_t(KEY_F));
++        QCOMPARE(keySpy.at(1).at(1).toUInt(), uint32_t(WL_KEYBOARD_KEY_STATE_RELEASED));
++        QVERIFY(commitStringSpy.isEmpty());
++
++        bool sawAlt = false;
++        bool sawClearAfterAlt = false;
++        for (const QList<QVariant> &args : modifierSpy) {
++            const uint32_t depressed = args.at(0).toUInt();
++            sawAlt |= depressed == keyboard->altMask();
++            sawClearAfterAlt |= sawAlt && depressed == 0;
++        }
++        QVERIFY(sawAlt);
++        QVERIFY(sawClearAfterAlt);
++    }
++
+     void cleanupTestCase()
+     {
+         if (m_child) {
+diff --git a/src/inputlisteneritem.cpp b/src/inputlisteneritem.cpp
+index 01c83dd..d629f70 100644
+--- a/src/inputlisteneritem.cpp
++++ b/src/inputlisteneritem.cpp
+@@ -336,6 +336,12 @@ void InputListenerItem::keyPressEvent(QKeyEvent *event)
+         return;
+     }
+ 
++    constexpr Qt::KeyboardModifiers combinationModifiers = Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier;
++    if ((event->modifiers() & combinationModifiers) && m_input.modifiedKey(event, InputPlugin::Pressed)) {
++        event->accept();
++        return;
++    }
++
+     const QList<xkb_keysym_t> keys = QXkbCommon::toKeysym(event);
+     for (auto key : keys) {
+         // Simulate key press only if it's not textual
+@@ -351,6 +357,12 @@ void InputListenerItem::keyReleaseEvent(QKeyEvent *event)
+         return;
+     }
+ 
++    constexpr Qt::KeyboardModifiers combinationModifiers = Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier;
++    if ((event->modifiers() & combinationModifiers) && m_input.modifiedKey(event, InputPlugin::Released)) {
++        event->accept();
++        return;
++    }
++
+     const QList<xkb_keysym_t> keys = QXkbCommon::toKeysym(event);
+     for (auto key : keys) {
+         if (event->text().isEmpty() || key == XKB_KEY_Return) { // (return is technically "\n")
+diff --git a/src/inputmethod.cpp b/src/inputmethod.cpp
+index 85546a8..0d4660a 100644
+--- a/src/inputmethod.cpp
++++ b/src/inputmethod.cpp
+@@ -15,6 +15,7 @@
+ #include <fcntl.h>
+ #include <sys/mman.h>
+ #include <unistd.h>
++#include <xkbcommon/xkbcommon-names.h>
+ 
+ InputMethod::InputMethod()
+     : QWaylandClientExtensionTemplate<InputMethod>(1)
+@@ -115,6 +116,67 @@ Keyboard::~Keyboard()
+     //        release();
+ }
+ 
++std::optional<quint32> Keyboard::keycodeForKeysym(xkb_keysym_t keysym) const
++{
++    if (!mXkbKeymap) {
++        return std::nullopt;
++    }
++
++    const xkb_keysym_t lowercaseKeysym = xkb_keysym_to_lower(keysym);
++    const xkb_keycode_t minimum = xkb_keymap_min_keycode(mXkbKeymap.get());
++    const xkb_keycode_t maximum = xkb_keymap_max_keycode(mXkbKeymap.get());
++
++    for (xkb_keycode_t keycode = minimum; keycode <= maximum; ++keycode) {
++        const xkb_layout_index_t layouts = xkb_keymap_num_layouts_for_key(mXkbKeymap.get(), keycode);
++        for (xkb_layout_index_t layout = 0; layout < layouts; ++layout) {
++            const xkb_level_index_t levels = xkb_keymap_num_levels_for_key(mXkbKeymap.get(), keycode, layout);
++            for (xkb_level_index_t level = 0; level < levels; ++level) {
++                const xkb_keysym_t *keysyms = nullptr;
++                const int count = xkb_keymap_key_get_syms_by_level(mXkbKeymap.get(), keycode, layout, level, &keysyms);
++                for (int index = 0; index < count; ++index) {
++                    if (keysyms[index] == keysym || xkb_keysym_to_lower(keysyms[index]) == lowercaseKeysym) {
++                        // wl_keyboard keycodes are evdev keycodes, offset by eight from XKB keycodes.
++                        if (keycode >= 8) {
++                            return keycode - 8;
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    return std::nullopt;
++}
++
++quint32 Keyboard::nativeModifiers(Qt::KeyboardModifiers modifiers) const
++{
++    if (!mXkbKeymap) {
++        return 0;
++    }
++
++    quint32 mask = 0;
++    const auto addModifier = [this, modifiers, &mask](Qt::KeyboardModifier qtModifier, const char *xkbName) {
++        if (!(modifiers & qtModifier)) {
++            return;
++        }
++        const xkb_mod_index_t index = xkb_keymap_mod_get_index(mXkbKeymap.get(), xkbName);
++        if (index != XKB_MOD_INVALID && index < 32) {
++            mask |= quint32(1) << index;
++        }
++    };
++
++    addModifier(Qt::ShiftModifier, XKB_MOD_NAME_SHIFT);
++    addModifier(Qt::ControlModifier, XKB_MOD_NAME_CTRL);
++    addModifier(Qt::AltModifier, XKB_MOD_NAME_ALT);
++    addModifier(Qt::MetaModifier, XKB_MOD_NAME_LOGO);
++    return mask;
++}
++
++quint32 Keyboard::currentLayout() const
++{
++    return mXkbState ? xkb_state_serialize_layout(mXkbState.get(), XKB_STATE_LAYOUT_EFFECTIVE) : 0;
++}
++
+ void Keyboard::keyboard_keymap(uint32_t format, int32_t fd, uint32_t size)
+ {
+     mKeymapFormat = format;
+diff --git a/src/inputmethod_p.h b/src/inputmethod_p.h
+index 5fb9aaf..cae6dc7 100644
+--- a/src/inputmethod_p.h
++++ b/src/inputmethod_p.h
+@@ -12,6 +12,7 @@
+ #include <QtWaylandClient/QWaylandClientExtensionTemplate>
+ 
+ #include <memory>
++#include <optional>
+ #include <qwayland-input-method-unstable-v1.h>
+ #include <qwayland-wayland.h>
+ 
+@@ -94,6 +95,10 @@ public:
+     Keyboard(::wl_keyboard *keyboard, InputMethodContext *parent);
+     ~Keyboard();
+ 
++    std::optional<quint32> keycodeForKeysym(xkb_keysym_t keysym) const;
++    quint32 nativeModifiers(Qt::KeyboardModifiers modifiers) const;
++    quint32 currentLayout() const;
++
+ Q_SIGNALS:
+     void keyPressed(QKeyEvent *keyEvent);
+     void keyReleased(QKeyEvent *keyEvent);
+diff --git a/src/inputplugin.cpp b/src/inputplugin.cpp
+index 4cd0145..9fbc965 100644
+--- a/src/inputplugin.cpp
++++ b/src/inputplugin.cpp
+@@ -114,6 +114,35 @@ void InputPlugin::key(KeyState state, quint32 scancode)
+     m_context->key(m_context->m_lastKeyboardSerial, m_context->m_lastKeyboardTime, scancode, static_cast<uint32_t>(state));
+ }
+ 
++bool InputPlugin::modifiedKey(QKeyEvent *event, KeyState state)
++{
++    if (!m_context || !m_keyboard) {
++        return false;
++    }
++
++    const QList<xkb_keysym_t> keysyms = QXkbCommon::toKeysym(event);
++    for (const xkb_keysym_t keysym : keysyms) {
++        const auto keycode = m_keyboard->keycodeForKeysym(keysym);
++        if (!keycode) {
++            continue;
++        }
++
++        const quint32 modifiers = m_keyboard->nativeModifiers(event->modifiers());
++        if (state == Pressed) {
++            m_context->modifiers(m_context->m_lastKeyboardSerial, modifiers, 0, 0, m_keyboard->currentLayout());
++        }
++
++        key(state, *keycode);
++
++        if (state == Released) {
++            m_context->modifiers(m_context->m_lastKeyboardSerial, 0, 0, 0, m_keyboard->currentLayout());
++        }
++        return true;
++    }
++
++    return false;
++}
++
+ InputPlugin::ContentHint InputPlugin::contentHint() const
+ {
+     if (!m_context) {
+diff --git a/src/inputplugin.h b/src/inputplugin.h
+index c78b845..c7574c8 100644
+--- a/src/inputplugin.h
++++ b/src/inputplugin.h
+@@ -78,6 +78,7 @@ public:
+     };
+     void keysym(uint timestamp, uint sym, KeyState state, uint modifiers);
+     void key(KeyState state, quint32 scancode);
++    bool modifiedKey(QKeyEvent *event, KeyState state);
+ 
+     ContentHint contentHint() const;
+     ContentPurpose contentPurpose() const;
